@@ -4,6 +4,11 @@
 
 <p align="center">Windows 작업표시줄 대신 쓰는 macOS 스타일 <b>리퀴드 글라스 독</b></p>
 
+<p align="center">
+  <a href="https://github.com/sous1345/liquid-dock">sous1345/liquid-dock</a>을 수정한 버전입니다.<br>
+  원본에서 달라진 점은 <a href="docs/Modi.md">수정사항</a>(<code>docs/Modi.md</code>)에 작성되어 있습니다.
+</p>
+
 ---
 
 ## 특징
