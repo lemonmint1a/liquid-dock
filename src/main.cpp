@@ -53,7 +53,10 @@ static void BuildDocks() {
     // A replacement must exist on every monitor before hiding all native taskbars.
     g_docksReady = !mons.empty() && g_docks.size() == mons.size();
     if (!g_docksReady) g_docks.clear();
-    if (g_docksReady && WatchdogReady()) { if (!g_taskbar.hidden) g_taskbar.Hide(); }
+    if (g_docksReady && WatchdogReady()) {
+        if (!g_taskbar.hidden) g_taskbar.Hide();
+        nativetray::CacheStartButtons();   // passive: caches only if a taskbar is expanded now
+    }
     else g_taskbar.Restore();
 }
 

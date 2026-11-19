@@ -281,34 +281,18 @@ void Dock::SyncSlots() {
     dirty = true;
 }
 
-namespace {
-// The shell's own pop-ups, by process: the taskbar comes up with them, so the dock does too.
-bool ShellPopupWindow(HWND w) {
-    static HWND last = nullptr; static bool lastResult = false;   // the foreground window rarely changes
-    if (w == last) return lastResult;
-    last = w; lastResult = false;
-    DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
-    HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
-    if (!p) return false;
-    wchar_t path[MAX_PATH]; DWORD n = MAX_PATH;
-    if (QueryFullProcessImageNameW(p, 0, path, &n)) {
-        const wchar_t* name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
-        for (const wchar_t* shell : { L"StartMenuExperienceHost.exe", L"SearchHost.exe", L"SearchApp.exe",
-                                      L"ShellExperienceHost.exe", L"ShellHost.exe" })
-            if (!_wcsicmp(name, shell)) { lastResult = true; break; }
-    }
-    CloseHandle(p);
-    return lastResult;
-}
-}
-
-bool (*Dock::isShellPopup)(HWND) = ShellPopupWindow;
+bool (*Dock::isShellPopup)(HWND) = nativetray::IsShellPopupWindow;
 
 bool Dock::ShellPopupOpen() const {
     HWND fg = GetForegroundWindow();
     if (!fg || fg == hwnd) return false;
+    if (!isShellPopup(fg)) return false;
+    // Ignore the zero-sized / off-screen transition window Explorer uses while a flyout opens;
+    // it briefly claims the other monitor. Only a real, on-screen surface counts.
+    RECT r{};
+    if (!GetWindowRect(fg, &r) || r.right - r.left < 80 || r.bottom - r.top < 80) return false;
     if (MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != monitor) return false;
-    return isShellPopup(fg);
+    return true;
 }
 
 bool Dock::FullscreenAppActive() const {
@@ -402,8 +386,14 @@ void Dock::Update(double now, float dt, POINT cursor) {
          CursorInPanel() ||
          (panelAlpha.target > 0.5f && cursorU >= cells[HitSensor].u0 - 4 * scale && cursorU <= cells[HitSensor].u1 + 4 * scale &&
           cursorV <= margin + barThick + 16 * scale));   // bridge between cell and panel
-    // the Windows key (Start), Win+S, Win+A, Win+N: the dock comes up with them, like the taskbar would
-    bool shellPopup = g_settings.showWithStart && ShellPopupOpen();
+    // the Windows key (Start), Win+S, Win+A, Win+N: the dock comes up with them, like the taskbar would.
+    // Require it to stay on this monitor for a moment: during the opening animation the
+    // foreground can briefly be a transition window on the other monitor, which made the
+    // wrong dock flash and disappear again.
+    bool shellPopupNow = g_settings.showWithStart && ShellPopupOpen();
+    if (shellPopupNow) { if (shellPopupSince < 0) shellPopupSince = now; }
+    else shellPopupSince = -1;
+    bool shellPopup = shellPopupNow && now - shellPopupSince >= 0.30;
     bool keep = menuOpen || dragging || pressSlot >= 0 || debugForceShow || settingsOpen || now < hotkeyHoldUntil || shellPopup;
     bool fullscreen = FullscreenAppActive();
     bool inPreview = windowPreview.Contains(cursor);
@@ -688,7 +678,14 @@ void Dock::Click(const Hit& h) {
     case HitSlot: {
         if (h.slot < 0 || h.slot >= (int)slots.size()) return;
         auto& s = slots[h.slot];
-        if (!s.app) { SendKeyCombo({ VK_LWIN }); return; }
+        if (!s.app) {
+            // Use the native Start button of this monitor's taskbar: sending Win would always
+            // open Start on the primary monitor.
+            int popupAtPress = startPopupAtPress;
+            startPopupAtPress = 0;
+            if (!nativetray::OpenStart(monitor, popupAtPress)) SendKeyCombo({ VK_LWIN });
+            return;
+        }
         auto app = s.app;
         if (g_settings.shiftRunsAsAdmin && (GetKeyState(VK_SHIFT) & 0x8000)) g_apps.Launch(*app, index, true);
         else g_apps.Click(*app, index);
@@ -741,6 +738,8 @@ LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
         Hit h = HitTestUV(u, v);
         pressKind = h.kind; pressSlot = h.kind == HitSlot ? h.slot : -1; pressButton = h.button;
+        startPopupAtPress = (h.kind == HitSlot && h.slot >= 0 && h.slot < (int)slots.size() && !slots[h.slot].app)
+            ? nativetray::StartPopupState(monitor) : 0;
         GetCursorPos(&pressPt);
         if (pressSlot >= 0) slots[pressSlot].press.target = 1;
         SetCapture(hwnd);

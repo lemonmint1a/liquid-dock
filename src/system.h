@@ -30,6 +30,9 @@ public:
     void Enforce(bool onUiThread = true);
     void StartEnforcer();
     bool WithInvisibleTaskbars(const std::function<bool()>& action);
+    // Like WithInvisibleTaskbars, but without the Enforce() afterwards: used while opening the
+    // Start menu, where re-applying auto-hide immediately after the toggle can undo the switch.
+    bool WithProtectedTaskbars(const std::function<bool()>& action);
     std::atomic<bool> hidden{ false };
 private:
     std::recursive_mutex mu;

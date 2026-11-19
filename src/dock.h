@@ -193,6 +193,7 @@ private:
     Spring reveal, magAmount, tooltipAlpha;
     float hoverU = 0, cursorU = -1, cursorV = 1e9;
     double edgeSince = -1, outsideSince = -1;
+    double shellPopupSince = -1;           // shell pop-up seen on this monitor for how long
     double hotkeyHoldUntil = 0;            // shown by the shortcut: stays until then (or while the pointer is on it)
     double lastCaptureWanted = -1e9, nextCaptureTry = 0;
     bool menuOpen = false;
@@ -218,6 +219,7 @@ private:
 
     // input
     int pressSlot = -1; HitKind pressKind = HitNone; ButtonId pressButton = ButtonId::Count;
+    int startPopupAtPress = 0;   // shell pop-up state when the Start slot was pressed (0/1/2)
     POINT pressPt{};
     bool dragging = false;
     int dropIndex = -1; bool dropRemove = false;

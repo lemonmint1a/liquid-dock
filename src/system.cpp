@@ -122,7 +122,10 @@ static void Vanish(HWND h) {
     // Explorer can rebuild the region while activating a native flyout. Keep
     // the entire taskbar transparent as well, independent of that region.
     taskbarvisibility::Protect(h);
-    if (!HasEmptyRegion(h) && IsWindowVisible(h) && h == FindWindowW(L"Shell_TrayWnd", nullptr)) nativetray::CacheTrayButtons(h);   // still expanded
+    if (!HasEmptyRegion(h) && IsWindowVisible(h)) {   // still expanded
+        if (h == FindWindowW(L"Shell_TrayWnd", nullptr)) nativetray::CacheTrayButtons(h);
+        nativetray::CacheStartButton(h);
+    }
     if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOWNA);   // e.g. hidden by an older version
     if (!HasEmptyRegion(h)) {
         HRGN r = CreateRectRgn(0, 0, 0, 0);
@@ -203,6 +206,15 @@ bool NativeTaskbar::WithInvisibleTaskbars(const std::function<bool()>& action) {
     Enforce();
     ForEachTaskbar([&](HWND h) { if (!taskbarvisibility::IsProtected(h)) result = false; });
     return result;
+}
+
+bool NativeTaskbar::WithProtectedTaskbars(const std::function<bool()>& action) {
+    std::lock_guard<std::recursive_mutex> lk(mu);
+    if (!hidden || !stateSaved) return false;
+    bool protectedAll = true; int count = 0;
+    ForEachTaskbar([&](HWND h) { ++count; if (!taskbarvisibility::Protect(h)) protectedAll = false; });
+    if (!count || !protectedAll) return false;
+    return action();
 }
 
 bool NativeTaskbar::Restore() {
