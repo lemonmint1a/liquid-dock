@@ -47,11 +47,16 @@ private:
     void SavePins();
     void LoadPins();
     void ImportTaskbarPins();
+    bool SyncTaskbarPins(bool addAllMissing);   // add taskbar apps pinned after the initial import
     void MigratePins();
     std::shared_ptr<AppItem> NewItem();
     void LoadIconAndName(AppItem& a, HWND sample);
+    bool RepairPin(AppItem& a);     // re-resolve a launcher whose path no longer exists
+    void EnsureLaunch(AppItem& a);  // derive a stable launch target for a running app being pinned
 
-    struct WinCache { std::wstring aumid, family, exe; bool valid = false; };   // family: store-app package
+    // family: store-app package. aumidTries: an AUMID set shortly after the window appears
+    // (Discord and other self-updating apps) is retried instead of being cached as empty forever.
+    struct WinCache { std::wstring aumid, family, exe; bool valid = false; int aumidTries = 0; };
     std::unordered_map<HWND, WinCache> winCache;
     int nextId = 1;
     bool dirty = true;

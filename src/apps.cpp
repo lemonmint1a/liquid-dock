@@ -106,6 +106,55 @@ static bool EndsWithI(const std::wstring& s, const wchar_t* suf) {
     return s.size() >= n && _wcsicmp(s.c_str() + s.size() - n, suf) == 0;
 }
 
+// A launch target that still exists (shell: URIs are checked elsewhere).
+static bool FileExistsPath(const std::wstring& p) {
+    if (p.empty() || p.rfind(L"shell:", 0) == 0) return false;
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static std::vector<std::wstring> PathParts(const std::wstring& path) {
+    std::vector<std::wstring> out;
+    size_t s = 0;
+    while (s < path.size()) {
+        size_t t = path.find(L'\\', s);
+        if (t == std::wstring::npos) t = path.size();
+        if (t > s) out.push_back(ToLower(path.substr(s, t - s)));
+        s = t + 1;
+    }
+    return out;
+}
+
+static std::wstring DirOf(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    return s == std::wstring::npos ? std::wstring() : path.substr(0, s);
+}
+
+// Number of leading folders two exe paths share. C:\Program Files (x86)\Steam\... == 3.
+static int CommonDirDepth(const std::wstring& a, const std::wstring& b) {
+    auto pa = PathParts(DirOf(a)), pb = PathParts(DirOf(b));
+    int n = 0;
+    while (n < (int)pa.size() && n < (int)pb.size() && pa[n] == pb[n]) ++n;
+    return n;
+}
+
+// "Steam" is a word-prefix of "Steam Client WebHelper" (the helper process Steam's UI runs in).
+static bool IsWordPrefix(const std::wstring& shortName, const std::wstring& longName) {
+    if (shortName.size() < 3 || shortName.size() > longName.size()) return false;
+    if (_wcsnicmp(shortName.c_str(), longName.c_str(), shortName.size()) != 0) return false;
+    if (shortName.size() == longName.size()) return false;
+    wchar_t n = longName[shortName.size()];
+    return n == L' ' || n == L'-' || n == L'(' || n == L'.';
+}
+
+// Same program in different versioned folders: Discord's stable Discord.exe vs
+// Discord\app-1.0.9269\Discord.exe. Requires the same exe name and a shared install folder.
+static bool SameAppExe(const std::wstring& a, const std::wstring& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a == b) return true;
+    if (_wcsicmp(FileStem(a).c_str(), FileStem(b).c_str()) != 0) return false;
+    return CommonDirDepth(a, b) >= 3;
+}
+
 static ComPtr<ID2D1Bitmap1> BitmapFromHBITMAP(HBITMAP hbm) {
     DIBSECTION ds = {};
     if (!GetObjectW(hbm, sizeof(ds), &ds) || !ds.dsBm.bmBits || ds.dsBm.bmBitsPixel != 32) {
@@ -311,7 +360,7 @@ void AppModel::LoadPins() {
     if (!f) {
         ImportTaskbarPins();
         SavePins();
-        g_settings.pinsVersion = 2;
+        g_settings.pinsVersion = 3;
         g_settings.Save();
         return;
     }
@@ -329,6 +378,11 @@ void AppModel::LoadPins() {
         LoadIconAndName(*a, nullptr);
         items.push_back(a);
     }
+    // Discord/Steam and other self-updating apps: a pin saved with a versioned exe path stops
+    // working after one update. Point it back at the Start Menu shortcut / AppsFolder entry.
+    bool repaired = false;
+    for (auto& a : items) if (RepairPin(*a)) repaired = true;
+    if (repaired) SavePins();
     structureVersion++;
 }
 
@@ -351,6 +405,16 @@ static bool ReadShortcut(const std::wstring& lnk, std::wstring& exe, std::wstrin
         ExpandEnvironmentStringsW(target, expanded, ARRAYSIZE(expanded));
         exe = ToLower(expanded);
     }
+    if (exe.empty()) {
+        // Shell links that have no target but an icon (File Explorer) still need an exe for
+        // matching their own windows.
+        wchar_t icon[MAX_PATH * 2] = {}; int index = 0;
+        if (SUCCEEDED(sl->GetIconLocation(icon, ARRAYSIZE(icon), &index)) && icon[0]) {
+            wchar_t expanded[MAX_PATH * 2];
+            ExpandEnvironmentStringsW(icon, expanded, ARRAYSIZE(expanded));
+            if (EndsWithI(expanded, L".exe")) exe = ToLower(expanded);
+        }
+    }
     ComPtr<IPropertyStore> ps;
     if (SUCCEEDED(sl.As(&ps))) {
         PROPVARIANT pv; PropVariantInit(&pv);
@@ -358,6 +422,230 @@ static bool ReadShortcut(const std::wstring& lnk, std::wstring& exe, std::wstrin
         PropVariantClear(&pv);
     }
     return true;
+}
+
+// ---------------------------------------------------------------- launch target repair
+// Start Menu shortcuts and the shell's AppsFolder are the stable way to start an app: Discord
+// and Steam change their own exe path on every update, so a pin that captured the exe path once
+// stops launching (Discord) or launches an internal helper instead of the client (Steam).
+
+struct ShellEntry {
+    std::wstring name;      // display name, e.g. "Steam"
+    std::wstring aumid;     // real AppUserModelID when the entry has one
+    std::wstring exe;       // filesystem target (lowercase)
+    std::wstring launch;    // .lnk path or shell:AppsFolder\...
+};
+
+static void EnumerateShortcutDir(std::vector<ShellEntry>& out, const std::wstring& dir, bool recurse) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"*.lnk").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            ShellEntry e;
+            e.launch = dir + fd.cFileName;
+            e.name = FileStem(e.launch);
+            ReadShortcut(e.launch, e.exe, e.aumid);
+            out.push_back(std::move(e));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (!recurse) return;
+    HANDLE d = FindFirstFileW((dir + L"*").c_str(), &fd);
+    if (d == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        EnumerateShortcutDir(out, dir + fd.cFileName + L"\\", true);
+    } while (FindNextFileW(d, &fd));
+    FindClose(d);
+}
+
+static const std::vector<ShellEntry>& StartMenuEntries() {
+    static std::vector<ShellEntry> entries;
+    static bool loaded = false;
+    if (loaded) return entries;
+    loaded = true;
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &p)) && p) {
+        EnumerateShortcutDir(entries, std::wstring(p) + L"\\", true);
+        CoTaskMemFree(p);
+    }
+    p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_CommonPrograms, 0, nullptr, &p)) && p) {
+        EnumerateShortcutDir(entries, std::wstring(p) + L"\\", true);
+        CoTaskMemFree(p);
+    }
+    p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p)) && p) {
+        std::wstring base = std::wstring(p) + L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\";
+        CoTaskMemFree(p);
+        EnumerateShortcutDir(entries, base + L"TaskBar\\", false);
+        // apps with their own AppUserModelID (Steam) are pinned here, not in the TaskBar folder
+        WIN32_FIND_DATAW fd;
+        std::wstring imp = base + L"ImplicitAppShortcuts\\";
+        HANDLE d = FindFirstFileW((imp + L"*").c_str(), &fd);
+        if (d != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+                EnumerateShortcutDir(entries, imp + fd.cFileName + L"\\", false);
+            } while (FindNextFileW(d, &fd));
+            FindClose(d);
+        }
+    }
+    return entries;
+}
+
+static const std::vector<ShellEntry>& AppsFolderEntries() {
+    static std::vector<ShellEntry> entries;
+    static bool loaded = false;
+    if (loaded) return entries;
+    loaded = true;
+    ComPtr<IShellItem> folder;
+    if (FAILED(SHGetKnownFolderItem(FOLDERID_AppsFolder, KF_FLAG_DONT_VERIFY, nullptr, IID_PPV_ARGS(&folder)))) return entries;
+    ComPtr<IEnumShellItems> en;
+    if (FAILED(folder->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en)))) return entries;
+    ComPtr<IShellItem> item;
+    while (en->Next(1, &item, nullptr) == S_OK) {
+        ShellEntry e;
+        PWSTR nm = nullptr, parsing = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &nm)) && nm) e.name = nm;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parsing)) && parsing && *parsing) {
+            std::wstring id = parsing;
+            e.launch = L"shell:AppsFolder\\" + id;
+            // a real AUMID (Discord's com.squirrel.Discord.Discord), not a path / GUID parsing name
+            if (id.find(L'\\') == std::wstring::npos && id.find(L'/') == std::wstring::npos &&
+                id.find(L':') == std::wstring::npos) e.aumid = id;
+        }
+        ComPtr<IShellItem2> si2;
+        ComPtr<IPropertyStore> ps;
+        if (SUCCEEDED(item.As(&si2)) && SUCCEEDED(si2->GetPropertyStore(GPS_DEFAULT, IID_PPV_ARGS(&ps)))) {
+            PROPVARIANT pv; PropVariantInit(&pv);
+            if (SUCCEEDED(ps->GetValue(PKEY_Link_TargetParsingPath, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+                std::wstring t = pv.pwszVal;
+                if (t.find(L'\\') != std::wstring::npos) e.exe = ToLower(t);
+            }
+            PropVariantClear(&pv);
+        }
+        if (!e.name.empty() && !e.launch.empty()) entries.push_back(std::move(e));
+        CoTaskMemFree(nm);
+        CoTaskMemFree(parsing);
+    }
+    return entries;
+}
+
+static int AppMatchScore(const AppItem& a, const ShellEntry& e) {
+    if (e.exe.empty() || !FileExistsPath(e.exe)) return -1;
+    int score = 0;
+    std::wstring ae = ToLower(a.exe), ee = ToLower(e.exe);
+    if (!a.aumid.empty() && !e.aumid.empty() && _wcsicmp(a.aumid.c_str(), e.aumid.c_str()) == 0) score += 1000;
+    if (!ae.empty() && ae == ee) score += 600;
+    else if (!ae.empty() && _wcsicmp(FileStem(ae).c_str(), FileStem(ee).c_str()) == 0) score += 300;
+    if (!a.name.empty() && !e.name.empty()) {
+        if (_wcsicmp(a.name.c_str(), e.name.c_str()) == 0) score += 200;
+        else if (IsWordPrefix(e.name, a.name) || IsWordPrefix(a.name, e.name)) score += 120;
+    }
+    int root = CommonDirDepth(ae, ee);
+    if (root >= 3) score += 20 * std::min(root, 6);
+    return score;
+}
+
+struct CanonicalApp {
+    bool valid = false;
+    std::wstring launch, exe, aumid, name;
+};
+
+static CanonicalApp FindCanonicalApp(const AppItem& a) {
+    CanonicalApp best;
+    int bestScore = 0;
+    auto consider = [&](const ShellEntry& e, int bonus) {
+        int s = AppMatchScore(a, e);
+        if (s < 0) return;
+        s += bonus;   // a Start Menu shortcut carries the app's AUMID; prefer it over a bare exe
+        if (s < 150) return;
+        bool better = s > bestScore;
+        if (s == bestScore && best.valid && PathParts(e.exe).size() < PathParts(best.exe).size()) better = true;
+        if (!better) return;
+        bestScore = s;
+        best.valid = true;
+        best.launch = e.launch;
+        best.exe = e.exe;
+        best.aumid = e.aumid;
+        best.name = e.name;
+    };
+    for (auto& e : StartMenuEntries()) consider(e, 20);
+    for (auto& e : AppsFolderEntries()) consider(e, 0);
+    return best;
+}
+
+bool AppModel::RepairPin(AppItem& a) {
+    std::wstring nm;
+    if (!a.aumid.empty() && a.aumid.find(L'!') != std::wstring::npos && AppsFolderItem(a.aumid, &nm)) {
+        std::wstring launch = L"shell:AppsFolder\\" + a.aumid;
+        if (a.launch == launch) return false;
+        a.launch = launch;
+        return true;
+    }
+
+    bool shellLaunch = a.launch.rfind(L"shell:", 0) == 0;
+    bool missing = !shellLaunch && !FileExistsPath(a.launch);
+    if (shellLaunch && !a.aumid.empty() && !AppsFolderItem(a.aumid, &nm)) missing = true;
+
+    // A shortcut still points at the app after it updates itself: follow it and keep its AUMID.
+    if (!shellLaunch && EndsWithI(a.launch, L".lnk") && FileExistsPath(a.launch)) {
+        std::wstring exe, aumid;
+        if (ReadShortcut(a.launch, exe, aumid) && !exe.empty() && FileExistsPath(exe)) {
+            bool changed = false;
+            if (_wcsicmp(a.exe.c_str(), exe.c_str()) != 0) { a.exe = exe; changed = true; }
+            if (a.aumid.empty() && !aumid.empty()) { a.aumid = aumid; changed = true; }
+            if (changed) {
+                a.icon.Reset();
+                LoadIconAndName(a, a.windows.empty() ? nullptr : a.windows.front());
+            }
+            return changed;
+        }
+    }
+
+    std::wstring current = a.exe;
+    if (current.empty() && !shellLaunch) current = a.launch;
+    CanonicalApp c = FindCanonicalApp(a);
+    if (!c.valid) return false;
+    // only step in when the saved path is gone, or when it points at a helper deep inside an
+    // install directory while the app's own launcher sits higher up (Steam Client WebHelper)
+    bool shallower = !current.empty() && PathParts(c.exe).size() + 1 < PathParts(current).size();
+    if (!missing && !shallower) return false;
+
+    bool changed = false;
+    if (!c.launch.empty() && _wcsicmp(a.launch.c_str(), c.launch.c_str()) != 0) { a.launch = c.launch; changed = true; }
+    if (!c.exe.empty() && _wcsicmp(a.exe.c_str(), c.exe.c_str()) != 0) { a.exe = c.exe; changed = true; }
+    if (a.aumid.empty() && !c.aumid.empty()) { a.aumid = c.aumid; changed = true; }
+    if (!c.name.empty() && (a.name.empty() || IsWordPrefix(c.name, a.name)) && a.name != c.name) { a.name = c.name; changed = true; }
+    if (changed) {
+        Log(L"repaired pin %s -> %s (%s)", a.name.c_str(), a.launch.c_str(), a.exe.c_str());
+        a.icon.Reset();
+        LoadIconAndName(a, a.windows.empty() ? nullptr : a.windows.front());
+    }
+    return changed;
+}
+
+// A running app has no saved launch target until it is pinned; use its Start Menu entry (stable
+// across self-updates) instead of the process exe it happens to be running from.
+void AppModel::EnsureLaunch(AppItem& a) {
+    if (!a.launch.empty()) return;
+    CanonicalApp c = FindCanonicalApp(a);
+    std::wstring nm;
+    if (c.valid) {
+        a.launch = c.launch;
+        if (!c.exe.empty()) a.exe = c.exe;
+        if (a.aumid.empty() && !c.aumid.empty()) a.aumid = c.aumid;
+        if (!c.name.empty() && (a.name.empty() || IsWordPrefix(c.name, a.name))) a.name = c.name;
+    } else if (!a.aumid.empty() && AppsFolderItem(a.aumid, &nm)) {
+        a.launch = L"shell:AppsFolder\\" + a.aumid;
+    } else {
+        a.launch = a.exe;
+    }
+    a.icon.Reset();
+    LoadIconAndName(a, a.windows.empty() ? nullptr : a.windows.front());
 }
 
 // The taskbar's own pin list (binary PIDL blob). Store (MSIX) apps are pinned only here - as
@@ -392,65 +680,213 @@ static std::wstring PackageFamily(const std::wstring& aumid) {
     return bang == std::wstring::npos ? std::wstring() : ToLower(aumid.substr(0, bang));
 }
 
-void AppModel::ImportTaskbarPins() {
+// A pin on the Windows taskbar, in taskbar order. Kept separate from AppItem so the same
+// collection can both seed a fresh pins.txt and add newly pinned apps to an existing one.
+struct TaskbarPin {
+    std::wstring name, aumid, exe, launch;
+    size_t pos = SIZE_MAX;
+};
+
+static bool SamePinIdentity(const TaskbarPin& a, const std::wstring& aumid, const std::wstring& exe) {
+    if (!a.aumid.empty() && !aumid.empty() && _wcsicmp(a.aumid.c_str(), aumid.c_str()) == 0) return true;
+    if (!a.exe.empty() && !exe.empty() && _wcsicmp(a.exe.c_str(), exe.c_str()) == 0) return true;
+    std::wstring af = PackageFamily(a.aumid), bf = PackageFamily(aumid);
+    return !af.empty() && af == bf;
+}
+
+static std::vector<TaskbarPin> CollectTaskbarPins() {
+    std::vector<TaskbarPin> out;
     PWSTR p = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) return;
-    std::wstring dir = std::wstring(p) + L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\";
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) return out;
+    std::wstring base = std::wstring(p) + L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\";
     CoTaskMemFree(p);
     std::wstring blob = TaskbandBlob();
-    std::vector<std::pair<size_t, std::shared_ptr<AppItem>>> found;
 
+    auto add = [&](TaskbarPin pin, size_t pos) {
+        for (auto& it : out) if (SamePinIdentity(it, pin.aumid, pin.exe)) return;
+        pin.pos = pos;
+        out.push_back(std::move(pin));
+    };
+    auto addShortcut = [&](const std::wstring& lnk, const wchar_t* fileName) {
+        TaskbarPin pin;
+        pin.name = FileStem(lnk);
+        pin.launch = lnk;
+        ReadShortcut(lnk, pin.exe, pin.aumid);
+        size_t pos = blob.find(fileName);
+        if (pos == std::wstring::npos && !pin.aumid.empty()) pos = blob.find(pin.aumid);
+        add(std::move(pin), pos);
+    };
+
+    std::wstring dir = base + L"TaskBar\\";
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((dir + L"*.lnk").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            std::wstring lnk = dir + fd.cFileName;
-            auto a = NewItem();
-            a->pinned = true;
-            a->name = FileStem(lnk);
-            a->launch = lnk;
-            ReadShortcut(lnk, a->exe, a->aumid);
-            size_t pos = blob.find(fd.cFileName);
-            found.push_back({ pos == std::wstring::npos ? SIZE_MAX : pos, a });
+            addShortcut(dir + fd.cFileName, fd.cFileName);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+    // Apps that carry their own AppUserModelID (Steam) are pinned under ImplicitAppShortcuts,
+    // not in the TaskBar folder. Missing them made Steam look like a running helper process.
+    std::wstring imp = base + L"ImplicitAppShortcuts\\";
+    HANDLE d = FindFirstFileW((imp + L"*").c_str(), &fd);
+    if (d != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            std::wstring sub = imp + fd.cFileName + L"\\";
+            WIN32_FIND_DATAW lfd;
+            HANDLE l = FindFirstFileW((sub + L"*.lnk").c_str(), &lfd);
+            if (l == INVALID_HANDLE_VALUE) continue;
+            do {
+                addShortcut(sub + lfd.cFileName, lfd.cFileName);
+            } while (FindNextFileW(l, &lfd));
+            FindClose(l);
+        } while (FindNextFileW(d, &fd));
+        FindClose(d);
+    }
     for (auto& [pos, id] : PackagedPins(blob)) {
+        TaskbarPin pin;
+        pin.aumid = id;
+        pin.launch = L"shell:AppsFolder\\" + id;
+        add(std::move(pin), pos);
+    }
+    // Some store pins put only the package family in the blob (Apple Music), so the app id after
+    // '!' is not there to read. Ask the shell which AppsFolder entry belongs to that family.
+    for (auto& e : AppsFolderEntries()) {
+        size_t bang = e.aumid.find(L'!');
+        if (bang == std::wstring::npos || bang < 2) continue;
+        std::wstring fam = e.aumid.substr(0, bang);
+        size_t pos = blob.find(fam);
+        if (pos == std::wstring::npos) continue;
+        TaskbarPin pin;
+        pin.name = e.name;
+        pin.aumid = e.aumid;
+        pin.launch = e.launch;
+        add(std::move(pin), pos);
+    }
+    std::stable_sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.pos < b.pos; });
+    return out;
+}
+
+void AppModel::ImportTaskbarPins() {
+    for (auto& pin : CollectTaskbarPins()) {
         auto a = NewItem();
         a->pinned = true;
-        a->aumid = id;
-        a->launch = L"shell:AppsFolder\\" + id;
-        found.push_back({ pos, a });
-    }
-    std::stable_sort(found.begin(), found.end(), [](auto& x, auto& y) { return x.first < y.first; });
-    for (auto& [pos, a] : found) {
+        a->name = pin.name;
+        a->aumid = pin.aumid;
+        a->exe = pin.exe;
+        a->launch = pin.launch;
         LoadIconAndName(*a, nullptr);
         items.push_back(a);
         Log(L"imported pin %s (%s | %s)", a->name.c_str(), a->exe.c_str(), a->aumid.c_str());
     }
 }
 
-// Pins saved by versions that did not know about store apps: add the missing ones once.
-void AppModel::MigratePins() {
-    if (g_settings.pinsVersion >= 2) return;
-    std::wstring blob = TaskbandBlob();
-    int added = 0;
-    for (auto& [pos, id] : PackagedPins(blob)) {
-        std::wstring fam = PackageFamily(id);
-        bool have = std::any_of(items.begin(), items.end(), [&](auto& it) { return !it->aumid.empty() && PackageFamily(it->aumid) == fam; });
-        if (have) continue;
+// A stable identity for "which taskbar pins have we already seen". AUMID first (survives
+// updates), then the exe path, then the .lnk path.
+static std::wstring PinIdentity(const TaskbarPin& p) {
+    if (!p.aumid.empty()) return ToLower(p.aumid);
+    if (!p.exe.empty()) return L"exe:" + ToLower(p.exe);
+    return L"lnk:" + ToLower(p.launch);
+}
+
+// Add taskbar pins that are missing from an existing pins.txt. On the one-time migration
+// (addAllMissing) every missing pin is added; afterwards only apps newly pinned to the taskbar
+// are added, so unpinning something in the dock is not undone on the next launch.
+bool AppModel::SyncTaskbarPins(bool addAllMissing) {
+    auto pins = CollectTaskbarPins();
+    if (pins.empty()) return false;
+    auto matches = [](const AppItem& a, const TaskbarPin& p) {
+        if (!p.aumid.empty() && !a.aumid.empty() && _wcsicmp(a.aumid.c_str(), p.aumid.c_str()) == 0) return true;
+        std::wstring pf = PackageFamily(p.aumid), af = PackageFamily(a.aumid);
+        if (!pf.empty() && pf == af) return true;
+        if (!p.exe.empty() && !a.exe.empty() && _wcsicmp(a.exe.c_str(), p.exe.c_str()) == 0) return true;
+        if (!p.launch.empty() && _wcsicmp(a.launch.c_str(), p.launch.c_str()) == 0) return true;
+        return false;
+    };
+
+    std::unordered_map<std::wstring, int> seen;
+    bool seedOnly = !addAllMissing;
+    {
+        std::ifstream f(AppDataDir() + L"\\taskbar_seen.txt");
+        if (f) {
+            seedOnly = false;
+            std::string line;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) seen[FromUtf8(line)] = 1;
+            }
+        }
+    }
+
+    bool added = false;
+    for (size_t i = 0; i < pins.size(); ++i) {
+        auto& p = pins[i];
+        if (seedOnly || (!addAllMissing && seen.count(PinIdentity(p)))) continue;
+        auto it = std::find_if(items.begin(), items.end(), [&](auto& a) { return matches(*a, p); });
+        if (it != items.end()) {
+            if (!(*it)->pinned) {   // the app is running but was not pinned in the dock yet
+                auto sp = *it;
+                SetPinned(*sp, true);
+                added = true;
+            }
+            continue;
+        }
         auto a = NewItem();
         a->pinned = true;
-        a->aumid = id;
-        a->launch = L"shell:AppsFolder\\" + id;
+        a->name = p.name;
+        a->aumid = p.aumid;
+        a->exe = p.exe;
+        a->launch = p.launch;
         LoadIconAndName(*a, nullptr);
-        items.insert(items.begin() + PinnedCount(), a);
-        added++;
-        Log(L"migrated store pin %s (%s)", a->name.c_str(), id.c_str());
+        int at = PinnedCount();
+        for (size_t j = i + 1; j < pins.size(); ++j) {
+            auto next = std::find_if(items.begin(), items.begin() + PinnedCount(), [&](auto& a2) { return matches(*a2, pins[j]); });
+            if (next != items.begin() + PinnedCount()) { at = (int)(next - items.begin()); break; }
+        }
+        items.insert(items.begin() + at, a);
+        Log(L"added taskbar pin %s (%s | %s)", a->name.c_str(), a->exe.c_str(), a->aumid.c_str());
+        added = true;
+    }
+
+    // remember what the taskbar had, so a dock pin the user removed stays removed
+    {
+        std::ofstream f(AppDataDir() + L"\\taskbar_seen.txt", std::ios::trunc);
+        for (auto& p : pins) f << ToUtf8(PinIdentity(p)) << "\n";
     }
     if (added) { structureVersion++; SavePins(); }
-    g_settings.pinsVersion = 2;
-    g_settings.Save();
+    return added;
+}
+
+// Pins saved by older versions: add store apps (v2) and taskbar apps that were pinned later (v3).
+void AppModel::MigratePins() {
+    if (g_settings.pinsVersion < 2) {
+        std::wstring blob = TaskbandBlob();
+        int added = 0;
+        for (auto& [pos, id] : PackagedPins(blob)) {
+            std::wstring fam = PackageFamily(id);
+            bool have = std::any_of(items.begin(), items.end(), [&](auto& it) { return !it->aumid.empty() && PackageFamily(it->aumid) == fam; });
+            if (have) continue;
+            auto a = NewItem();
+            a->pinned = true;
+            a->aumid = id;
+            a->launch = L"shell:AppsFolder\\" + id;
+            LoadIconAndName(*a, nullptr);
+            items.insert(items.begin() + PinnedCount(), a);
+            added++;
+            Log(L"migrated store pin %s (%s)", a->name.c_str(), id.c_str());
+        }
+        if (added) { structureVersion++; SavePins(); }
+        g_settings.pinsVersion = 2;
+        g_settings.Save();
+    }
+    if (g_settings.pinsVersion < 3) {
+        SyncTaskbarPins(true);      // one-time: add everything missing from the taskbar
+        g_settings.pinsVersion = 3;
+        g_settings.Save();
+    } else {
+        SyncTaskbarPins(false);     // afterwards only apps newly pinned to the taskbar
+    }
 }
 
 void AppModel::PinFile(const std::wstring& path, int index) {
@@ -478,12 +914,9 @@ void AppModel::PinFile(const std::wstring& path, int index) {
 void AppModel::SetPinned(AppItem& a, bool pinned) {
     if (a.pinned == pinned) return;
     if (pinned) {
-        if (a.launch.empty()) {
-            std::wstring nm;
-            if (!a.aumid.empty() && AppsFolderItem(a.aumid, &nm)) a.launch = L"shell:AppsFolder\\" + a.aumid;
-            else a.launch = a.exe;
-        }
+        if (a.launch.empty()) EnsureLaunch(a);
         MoveTo(a, PinnedCount(), true);
+        if (RepairPin(a)) SavePins();
     } else {
         a.pinned = false;
         // move to the running section (or drop entirely when not running)
@@ -503,11 +936,7 @@ void AppModel::MoveTo(AppItem& a, int index, bool pin) {
     auto sp = *it;
     items.erase(it);
     if (pin) {
-        if (sp->launch.empty()) {
-            std::wstring nm;
-            if (!sp->aumid.empty() && AppsFolderItem(sp->aumid, &nm)) sp->launch = L"shell:AppsFolder\\" + sp->aumid;
-            else sp->launch = sp->exe;
-        }
+        if (sp->launch.empty()) EnsureLaunch(*sp);
         sp->pinned = true;
         index = std::clamp(index, 0, PinnedCount());
     } else {
@@ -543,7 +972,18 @@ void AppModel::Refresh() {
     for (HWND h : wins) {
         WinCache wc;
         auto f = winCache.find(h);
-        if (f != winCache.end()) wc = f->second;
+        if (f != winCache.end()) {
+            wc = f->second;
+            // Some apps (Discord) set their AUMID just after the first window appears. Do not keep
+            // the empty value from that first look forever.
+            if (wc.aumid.empty() && wc.aumidTries < 4) {
+                DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+                std::wstring late = WindowAumid(h);
+                if (late.empty()) late = ProcessAumid(pid);
+                if (!late.empty()) { wc.aumid = late; wc.family = PackageFamily(late); }
+                wc.aumidTries++;
+            }
+        }
         else {
             DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
             wc.exe = ProcessExe(pid);
@@ -580,6 +1020,9 @@ void AppModel::Refresh() {
         if (!match && !wc.exe.empty())
             for (auto& a : items)
                 if (a->exe == wc.exe && (a->aumid.empty() || wc.aumid.empty())) { match = a; break; }
+        if (!match && !wc.exe.empty())
+            for (auto& a : items)
+                if (SameAppExe(a->exe, wc.exe) && (a->aumid.empty() || wc.aumid.empty())) { match = a; break; }
         if (!match && g_demoMode) continue;
         if (!match) {
             match = NewItem();
@@ -590,6 +1033,9 @@ void AppModel::Refresh() {
             Log(L"running app: %s (aumid %s, package %s)", match->name.c_str(), wc.aumid.c_str(), wc.family.c_str());
             prevCounts.push_back(0);
             structural = true;
+        } else if (match->pinned && match->aumid.empty() && !wc.aumid.empty()) {
+            match->aumid = wc.aumid;   // the window knows the app's AUMID even if the pin did not
+            SavePins();
         }
         match->windows.push_back(h);
     }
@@ -668,18 +1114,42 @@ void AppModel::ActivateWindow(HWND h) {
     }
 }
 
-void AppModel::Launch(AppItem& a, int dockIndex, bool elevated) {
+static std::wstring LaunchTargetOf(const AppItem& a) {
     std::wstring target = a.launch;
     if (target.empty()) target = !a.aumid.empty() ? L"shell:AppsFolder\\" + a.aumid : a.exe;
-    if (EndsWithI(target, L".lnk") && GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES && !a.exe.empty())
-        target = a.exe;
-    if (target.empty()) return;
+    if (target.rfind(L"shell:", 0) != 0 && !FileExistsPath(target)) {
+        if (!a.exe.empty() && FileExistsPath(a.exe)) target = a.exe;
+        else if (!a.aumid.empty()) target = L"shell:AppsFolder\\" + a.aumid;
+    }
+    return target;
+}
+
+static bool ShellLaunch(const std::wstring& target, const wchar_t* verb) {
+    if (target.empty()) return false;
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.fMask = SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
     sei.lpFile = target.c_str();
-    if (elevated && target.rfind(L"shell:", 0) != 0) sei.lpVerb = L"runas";   // Windows shows its own consent prompt
+    sei.lpVerb = verb;
     sei.nShow = SW_SHOWNORMAL;
-    if (ShellExecuteExW(&sei)) {
+    return ShellExecuteExW(&sei) != FALSE;
+}
+
+void AppModel::Launch(AppItem& a, int dockIndex, bool elevated) {
+    std::wstring target = LaunchTargetOf(a);
+    bool repaired = false;
+    // A self-updating app left the pinned path behind: find its current launcher and retry.
+    if ((target.empty() || (target.rfind(L"shell:", 0) != 0 && !FileExistsPath(target))) && !repaired) {
+        repaired = RepairPin(a);
+        target = LaunchTargetOf(a);
+    }
+    const wchar_t* verb = (elevated && target.rfind(L"shell:", 0) != 0) ? L"runas" : nullptr;   // Windows shows its own consent prompt
+    bool ok = ShellLaunch(target, verb);
+    if (!ok && !repaired && RepairPin(a)) {
+        target = LaunchTargetOf(a);
+        verb = (elevated && target.rfind(L"shell:", 0) != 0) ? L"runas" : nullptr;
+        ok = ShellLaunch(target, verb);
+    }
+    if (ok) {
         a.launchStarted = NowSeconds();
         a.launchDock = dockIndex;
         a.launchWindowCount = a.windows.size();
