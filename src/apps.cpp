@@ -1102,16 +1102,51 @@ void AppModel::OnShellHook(WPARAM code, LPARAM lp) {
 // ---------------------------------------------------------------- actions
 
 void AppModel::ActivateWindow(HWND h) {
-    if (IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
-    if (!SetForegroundWindow(h) || GetForegroundWindow() != h) {
-        HWND fg = GetForegroundWindow();
-        DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-        DWORD me = GetCurrentThreadId();
-        if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, TRUE);
-        BringWindowToTop(h);
-        SetForegroundWindow(h);
-        if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, FALSE);
+    if (!h || !IsWindow(h)) return;
+    HWND fg = GetForegroundWindow();
+    // A minimized window can remain the foreground window. Only an actually visible,
+    // non-minimized foreground window means there is nothing to do.
+    if (fg == h && !IsIconic(h) && IsWindowVisible(h)) return;
+
+    // Restore synchronously. ShowWindowAsync queues the restore, so SetForegroundWindow can run
+    // while the window is still iconic and be ignored (the intermittent "click does nothing").
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    else if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOW);
+
+    DWORD me = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(h, nullptr);
+    DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+
+    // Share the input queues with both the foreground and the target thread. Attaching to the
+    // target as well is what lets SetForegroundWindow/SetActiveWindow stick for the target.
+    bool attachTarget = targetThread && targetThread != me && AttachThreadInput(me, targetThread, TRUE);
+    bool attachFg = fgThread && fgThread != me && fgThread != targetThread && AttachThreadInput(me, fgThread, TRUE);
+
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SetActiveWindow(h);
+
+    // Windows' foreground lock can still refuse the change (another app was foreground, the
+    // restore animation is running, or the app is elevated). Verify and retry; a quick Alt tap
+    // makes the shell treat this process as the last input owner and releases the lock.
+    if (GetForegroundWindow() != h) {
+        Log(L"activate: retry hwnd %p (fg %p, iconic %d, attach %d/%d)", h, fg, (int)IsIconic(h), (int)attachTarget, (int)attachFg);
+        for (int attempt = 0; attempt < 4 && GetForegroundWindow() != h; ++attempt) {
+            INPUT in[2] = {};
+            in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_MENU;
+            in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_MENU; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, in, sizeof(INPUT));
+            if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+            BringWindowToTop(h);
+            SetForegroundWindow(h);
+            if (GetForegroundWindow() == h) break;
+            Sleep(15);
+        }
     }
+
+    if (attachFg) AttachThreadInput(me, fgThread, FALSE);
+    if (attachTarget) AttachThreadInput(me, targetThread, FALSE);
+    if (GetForegroundWindow() != h) Log(L"activate failed: hwnd %p class %s", h, WindowClass(h).c_str());
 }
 
 static std::wstring LaunchTargetOf(const AppItem& a) {
@@ -1160,13 +1195,17 @@ void AppModel::Click(AppItem& a, int dockIndex) {
     if (a.windows.empty()) { Launch(a, dockIndex); return; }
     HWND fg = GetForegroundWindow();
     auto it = std::find(a.windows.begin(), a.windows.end(), fg);
-    if (it != a.windows.end()) {
+    // A minimized window can still be the foreground window for a moment. Treating that as
+    // "already active" used to minimize/cycle it again, so clicking the dock icon did nothing.
+    if (it != a.windows.end() && !IsIconic(fg)) {
         if (a.windows.size() == 1) {
             PostMessageW(fg, WM_SYSCOMMAND, SC_MINIMIZE, 0);
         } else {
             // cycle: bring the bottom-most window of this app to the front
             ActivateWindow(a.windows.back());
         }
+    } else if (it != a.windows.end()) {
+        ActivateWindow(fg);   // the app's foreground window is minimized: restore it
     } else {
         ActivateWindow(a.windows.front());
     }
