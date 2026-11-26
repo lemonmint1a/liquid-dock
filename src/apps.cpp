@@ -1103,15 +1103,30 @@ void AppModel::OnShellHook(WPARAM code, LPARAM lp) {
 
 void AppModel::ActivateWindow(HWND h) {
     if (!h || !IsWindow(h)) return;
-    HWND fg = GetForegroundWindow();
     // A minimized window can remain the foreground window. Only an actually visible,
     // non-minimized foreground window means there is nothing to do.
-    if (fg == h && !IsIconic(h) && IsWindowVisible(h)) return;
+    auto active = [h] {
+        return GetForegroundWindow() == h && !IsIconic(h) && IsWindowVisible(h);
+    };
+    if (active()) return;
+    HWND fg = GetForegroundWindow();
 
     // Restore synchronously. ShowWindowAsync queues the restore, so SetForegroundWindow can run
     // while the window is still iconic and be ignored (the intermittent "click does nothing").
-    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
-    else if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOW);
+    // UIPI blocks ShowWindow for windows owned by a higher-integrity process (Task Manager is
+    // auto-elevated), so a failed restore is handled by SwitchToThisWindow further down.
+    bool restoreBlocked = false;
+    if (IsIconic(h)) {
+        SetLastError(ERROR_SUCCESS);
+        ShowWindow(h, SW_RESTORE);
+        DWORD err = GetLastError();
+        restoreBlocked = IsIconic(h) || err == ERROR_ACCESS_DENIED;
+    } else if (!IsWindowVisible(h)) {
+        SetLastError(ERROR_SUCCESS);
+        ShowWindow(h, SW_SHOW);
+        DWORD err = GetLastError();
+        restoreBlocked = !IsWindowVisible(h) || err == ERROR_ACCESS_DENIED;
+    }
 
     DWORD me = GetCurrentThreadId();
     DWORD targetThread = GetWindowThreadProcessId(h, nullptr);
@@ -1129,9 +1144,9 @@ void AppModel::ActivateWindow(HWND h) {
     // Windows' foreground lock can still refuse the change (another app was foreground, the
     // restore animation is running, or the app is elevated). Verify and retry; a quick Alt tap
     // makes the shell treat this process as the last input owner and releases the lock.
-    if (GetForegroundWindow() != h) {
+    if (!active() && !restoreBlocked) {
         Log(L"activate: retry hwnd %p (fg %p, iconic %d, attach %d/%d)", h, fg, (int)IsIconic(h), (int)attachTarget, (int)attachFg);
-        for (int attempt = 0; attempt < 4 && GetForegroundWindow() != h; ++attempt) {
+        for (int attempt = 0; attempt < 4 && !active(); ++attempt) {
             INPUT in[2] = {};
             in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_MENU;
             in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_MENU; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
@@ -1139,14 +1154,29 @@ void AppModel::ActivateWindow(HWND h) {
             if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
             BringWindowToTop(h);
             SetForegroundWindow(h);
-            if (GetForegroundWindow() == h) break;
+            if (active()) break;
             Sleep(15);
         }
     }
 
     if (attachFg) AttachThreadInput(me, fgThread, FALSE);
     if (attachTarget) AttachThreadInput(me, targetThread, FALSE);
-    if (GetForegroundWindow() != h) Log(L"activate failed: hwnd %p class %s", h, WindowClass(h).c_str());
+
+    // A non-elevated dock cannot ShowWindow/SetForegroundWindow an elevated window. The calls
+    // above then fail silently (or only make the still-minimized window "foreground"), which is
+    // exactly the Task Manager click that did nothing. SwitchToThisWindow is handled by the
+    // window manager rather than by the target's input queue, so it is not filtered by UIPI and
+    // does restore minimized windows.
+    if (!active()) {
+        Log(L"activate: SwitchToThisWindow hwnd %p class %s (blocked %d, fg %p, iconic %d, visible %d)",
+            h, WindowClass(h).c_str(), (int)restoreBlocked, GetForegroundWindow(), (int)IsIconic(h), (int)IsWindowVisible(h));
+        SwitchToThisWindow(h, TRUE);
+        // The restore can finish on the target's UI thread after this call returns. Wait briefly
+        // so the diagnostic below does not report a success as a failure.
+        for (int i = 0; i < 20 && !active(); ++i) Sleep(10);
+    }
+
+    if (!active()) Log(L"activate failed: hwnd %p class %s", h, WindowClass(h).c_str());
 }
 
 static std::wstring LaunchTargetOf(const AppItem& a) {
